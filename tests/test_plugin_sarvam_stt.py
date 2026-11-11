@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
+import json
 import weakref
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import numpy as np
@@ -556,3 +559,217 @@ async def test_sarvam_stt_aclose_closes_session_of_garbage_collected_stream(
     await stt.aclose()
 
     assert session.closed, "STT.aclose() must close the session of a stream the caller dropped"
+
+
+class _ReconnectWS:
+    """Like Sarvam's endpoint, it never closes the socket on its own."""
+
+    close_code = 1000
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.closed = False
+        self._closed = asyncio.Event()
+        self.sent: list[dict] = []
+
+    async def send_str(self, data: str) -> None:
+        self.sent.append(json.loads(data))
+
+    def audio(self) -> bytes:
+        return b"".join(base64.b64decode(m["audio"]["data"]) for m in self.sent if "audio" in m)
+
+    async def receive(self) -> sarvam_stt.aiohttp.WSMessage:
+        await self._closed.wait()
+        return sarvam_stt.aiohttp.WSMessage(sarvam_stt.aiohttp.WSMsgType.CLOSED, 1000, "")
+
+    async def close(self) -> None:
+        self.closed = True
+        self._closed.set()
+
+
+class _ReconnectSession:
+    def __init__(self) -> None:
+        self.closed = False
+        self.sockets: list[_ReconnectWS] = []
+
+    async def ws_connect(self, url: str, **_: object) -> _ReconnectWS:
+        ws = _ReconnectWS(url)
+        self.sockets.append(ws)
+        return ws
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_sarvam_stt_stream_update_options_reconnects_instead_of_ending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _ReconnectSession()
+    monkeypatch.setattr(sarvam_stt.aiohttp, "ClientSession", lambda *a, **k: session)
+    stt = sarvam_stt.STT(api_key="sk_test")
+    stream = stt.stream()
+
+    async def _wait_for_connections(count: int) -> None:
+        while len(session.sockets) < count:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_wait_for_connections(1), timeout=2)
+    stream.update_options(language="hi-IN", model="saaras:v4")
+
+    await asyncio.wait_for(_wait_for_connections(2), timeout=2)
+    assert session.sockets[0].closed
+    assert "language-code=hi-IN" in session.sockets[1].url
+    assert not session.sockets[1].closed
+
+    await stream.aclose()
+    await stt.aclose()
+
+
+def _reconnect_stt(monkeypatch: pytest.MonkeyPatch) -> tuple[_ReconnectSession, sarvam_stt.STT]:
+    session = _ReconnectSession()
+    monkeypatch.setattr(sarvam_stt.aiohttp, "ClientSession", lambda *a, **k: session)
+    return session, sarvam_stt.STT(
+        api_key="sk_test", sample_rate=16000, input_audio_codec="pcm_s16le"
+    )
+
+
+async def _wait_until(predicate: Callable[[], bool]) -> None:
+    async def _poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout=2)
+
+
+async def _next_events(stream: sarvam_stt.SpeechStream, count: int) -> list:
+    return [await asyncio.wait_for(stream.__anext__(), timeout=2) for _ in range(count)]
+
+
+def _pcm_frame(ms: int, value: int) -> rtc.AudioFrame:
+    samples = 16000 * ms // 1000
+    return rtc.AudioFrame(bytes([value, 0]) * samples, 16000, 1, samples)
+
+
+async def test_sarvam_stt_reconnect_closes_the_open_utterance_on_the_old_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, stt = _reconnect_stt(monkeypatch)
+    stream = stt.stream()
+    await _wait_until(lambda: len(session.sockets) == 1)
+
+    frame = _pcm_frame(30, 1)  # short of a 50 ms chunk, so it sits in the buffer
+    stream.push_frame(frame)
+    await _wait_until(lambda: len(stream._audio_buffer) > 0)
+    await stream._handle_events({"data": {"signal_type": "START_SPEECH"}})
+
+    stream.update_options(language="hi-IN", model="saaras:v4")
+    old = session.sockets[0]
+    await _wait_until(lambda: {"type": "flush"} in old.sent)
+    assert old.audio() == frame.data.tobytes()
+    await stream._handle_transcript_data({"data": {"transcript": "नमस्ते", "language_code": "hi-IN"}})
+
+    await _wait_until(lambda: len(session.sockets) == 2)
+    assert old.closed
+    events = [event.type for event in await _next_events(stream, 4)]
+    assert events == [
+        sarvam_stt.stt.SpeechEventType.START_OF_SPEECH,
+        sarvam_stt.stt.SpeechEventType.RECOGNITION_USAGE,
+        sarvam_stt.stt.SpeechEventType.FINAL_TRANSCRIPT,
+        sarvam_stt.stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    assert not stream._speaking
+    await stream.aclose()
+    await stt.aclose()
+
+
+async def test_sarvam_stt_reconnect_waits_for_the_flushed_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transcript from earlier in the utterance doesn't end the wait for the flush."""
+    session, stt = _reconnect_stt(monkeypatch)
+    stream = stt.stream()
+    await _wait_until(lambda: len(session.sockets) == 1)
+    await stream._handle_events({"data": {"signal_type": "START_SPEECH"}})
+    await stream._handle_transcript_data({"data": {"transcript": "पहला", "language_code": "hi-IN"}})
+
+    stream.update_options(language="hi-IN", model="saaras:v4")
+    old = session.sockets[0]
+    await _wait_until(lambda: {"type": "flush"} in old.sent)
+    await asyncio.sleep(0.05)
+    assert not old.closed  # still waiting on the flushed audio's transcript
+    await stream._handle_transcript_data({"data": {"transcript": "दूसरा", "language_code": "hi-IN"}})
+
+    await _wait_until(lambda: len(session.sockets) == 2)
+    events = await _next_events(stream, 6)
+    texts = [e.alternatives[0].text for e in events if e.alternatives]
+    assert texts == ["पहला", "दूसरा"]
+    assert events[-1].type == sarvam_stt.stt.SpeechEventType.END_OF_SPEECH
+    await stream.aclose()
+    await stt.aclose()
+
+
+async def test_sarvam_stt_reconnect_ends_the_turn_when_no_transcript_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sarvam_stt, "RECONNECT_SETTLE_TIMEOUT", 0.05)
+    session, stt = _reconnect_stt(monkeypatch)
+    stream = stt.stream()
+    await _wait_until(lambda: len(session.sockets) == 1)
+    await stream._handle_events({"data": {"signal_type": "START_SPEECH"}})
+
+    stream.update_options(language="hi-IN", model="saaras:v4")
+    await _wait_until(lambda: len(session.sockets) == 2)
+    events = [event.type for event in await _next_events(stream, 2)]
+    assert events == [
+        sarvam_stt.stt.SpeechEventType.START_OF_SPEECH,
+        sarvam_stt.stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    await stream.aclose()
+    await stt.aclose()
+
+
+async def test_sarvam_stt_reconnect_carries_buffered_audio_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, stt = _reconnect_stt(monkeypatch)
+    stream = stt.stream()
+    await _wait_until(lambda: len(session.sockets) == 1)
+
+    first = _pcm_frame(30, 1)
+    stream.push_frame(first)
+    await _wait_until(lambda: len(stream._audio_buffer) > 0)
+    stream.update_options(language="hi-IN", model="saaras:v4")
+    await _wait_until(lambda: len(session.sockets) == 2)
+    assert session.sockets[0].audio() == b""
+
+    second = _pcm_frame(30, 2)
+    stream.push_frame(second)
+    new = session.sockets[1]
+    await _wait_until(lambda: len(new.audio()) > 0)
+    # one 50 ms chunk: all of the first frame, then the start of the second
+    assert new.audio() == (first.data.tobytes() + second.data.tobytes())[: 800 * 2]
+
+    await stream.aclose()
+    await stt.aclose()
+
+
+async def test_sarvam_stt_reconnect_keeps_transcript_times_on_the_stream_timeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, stt = _reconnect_stt(monkeypatch)
+    stream = stt.stream()
+    await _wait_until(lambda: len(session.sockets) == 1)
+    await asyncio.sleep(0.2)
+
+    stream.update_options(language="hi-IN", model="saaras:v4")
+    await _wait_until(lambda: len(session.sockets) == 2)
+    assert stream.start_time_offset >= 0.2
+
+    await stream._handle_transcript_data(
+        {"data": {"transcript": "नमस्ते", "language_code": "hi-IN", "speech_end": 1.7}}
+    )
+    usage, final = await _next_events(stream, 2)
+    assert final.type == sarvam_stt.stt.SpeechEventType.FINAL_TRANSCRIPT
+    assert final.alternatives[0].end_time >= 1.9
+    await stream.aclose()
+    await stt.aclose()
