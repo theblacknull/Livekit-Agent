@@ -19,7 +19,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Protocol, cast
+from typing import Protocol, cast, get_args
 
 import aiohttp
 import pytest
@@ -40,6 +40,7 @@ from livekit.plugins.reson8 import stt as reson8_stt
 from livekit.plugins.reson8._utils import (
     ERROR_MESSAGE_HEADER,
     INTEGRATION_HEADER,
+    MODEL_LANGUAGES,
     PRERECORDED_PATH,
     TURNS_PATH,
     _confidence,
@@ -455,8 +456,15 @@ def test_an_unrelated_update_leaves_the_capability_alone() -> None:
 def test_model_and_provider() -> None:
     assert reson8.STT(api_key="k").provider == "Reson8"
     assert reson8.STT(api_key="k").model == "default"
+    assert reson8.STT(api_key="k", model="rumble-2").model == "rumble-2"
+
     biasing = BiasingOptions(custom_model_id="m1")
-    assert reson8.STT(api_key="k", biasing=biasing).model == "m1"
+    assert reson8.STT(api_key="k", biasing=biasing).model == "default"
+
+
+def test_an_unsupported_model_raises() -> None:
+    with pytest.raises(ValueError, match="unsupported model"):
+        reson8.STT(api_key="k", model="rumble-2-flash")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +484,7 @@ def test_model_and_provider() -> None:
         (["nl", "de"], "nl,de"),
         (" nl , de ", "nl,de"),
         (["nl", "", "de"], "nl,de"),
+        ("ja,yue", "ja,yue"),
     ],
 )
 def test_normalize_languages(value: str | list[str] | None, expected: str | None) -> None:
@@ -491,6 +500,41 @@ def test_an_unsupported_language_raises(value: str | list[str]) -> None:
 def test_every_advertised_language_is_accepted() -> None:
     for code in reson8.SUPPORTED_LANGUAGES:
         assert normalize_languages(code) == code
+
+
+def test_every_model_language_is_advertised() -> None:
+    """With no model set, codes are checked against the advertised list alone."""
+
+    assert set(MODEL_LANGUAGES) == set(get_args(reson8.STTModel))
+    for languages in MODEL_LANGUAGES.values():
+        assert set(languages) <= set(reson8.SUPPORTED_LANGUAGES)
+
+
+def test_resonant_1_rejects_a_rumble_2_only_language() -> None:
+    with pytest.raises(ValueError, match="resonant-1 supports"):
+        reson8.STT(api_key="k", model="resonant-1", language="ja")
+
+
+@pytest.mark.parametrize("model", [None, "rumble-2"])
+def test_a_rumble_2_language_is_accepted_without_resonant_1(model: reson8.STTModel | None) -> None:
+    reson8.STT(api_key="k", model=model, language="ja")
+
+
+def test_a_language_override_is_checked_against_the_model() -> None:
+    instance = reson8.STT(api_key="k", model="resonant-1")
+
+    with pytest.raises(ValueError, match="unsupported language"):
+        instance.update_options(language="ja")
+
+    with pytest.raises(ValueError, match="unsupported language"):
+        instance.stream(language="ja")
+
+
+async def test_a_recognize_language_is_checked_before_any_request() -> None:
+    instance = reson8.STT(api_key="k", model="resonant-1")
+
+    with pytest.raises(ValueError, match="unsupported language"):
+        await instance.recognize(_frame(), language="ja", conn_options=NO_RETRY)
 
 
 # ---------------------------------------------------------------------------
@@ -544,32 +588,32 @@ def test_an_out_of_range_probability_raises(value: float) -> None:
     [
         (0.5, 0.4),
         (0.9, 0.7),
-        (0.95, None),  # above the server's 0.92 default
     ],
 )
-def test_inverted_thresholds_raise(eager: float, final: float | None) -> None:
+def test_inverted_thresholds_raise(eager: float, final: float) -> None:
     with pytest.raises(ValueError, match="must be below"):
         TurnOptions(eager_probability=eager, final_probability=final)
+
+
+def test_equal_thresholds_warn(caplog: pytest.LogCaptureFixture) -> None:
+    """Equal thresholds are legal but pointless: the preflight gets no lead."""
+
+    with caplog.at_level("WARNING"):
+        TurnOptions(eager_probability=0.5, final_probability=0.5)
+    assert caplog.records
 
 
 @pytest.mark.parametrize(
     ("eager", "final"),
     [
-        (0.5, 0.5),  # both explicit, identical
-        (None, 0.5),  # 0.5 == the server's default eager
+        (None, None),
+        (0.35, 0.7),
+        # defaults differ per model, so a lone threshold is not checked against one
+        (0.95, None),
+        (None, 0.4),
+        (None, 0.5),
     ],
 )
-def test_equal_thresholds_warn(
-    eager: float | None, final: float, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Equal thresholds are legal but pointless: the preflight gets no lead."""
-
-    with caplog.at_level("WARNING"):
-        TurnOptions(eager_probability=eager, final_probability=final)
-    assert caplog.records
-
-
-@pytest.mark.parametrize(("eager", "final"), [(None, None), (0.35, 0.7)])
 def test_sane_thresholds_are_quiet(
     eager: float | None, final: float | None, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -699,6 +743,35 @@ def test_negative_strength_raises() -> None:
         BiasingOptions(strength=-0.1)
 
 
+@pytest.mark.parametrize(
+    ("biasing", "message"),
+    [
+        pytest.param(BiasingOptions(patterns=["AMZ[0-9]{6}"]), "patterns", id="patterns"),
+        pytest.param(BiasingOptions(strength=1.2), "at most 1", id="strength"),
+    ],
+)
+def test_rumble_2_rejects_biasing_it_cannot_apply(biasing: BiasingOptions, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        reson8.STT(api_key="k", model="rumble-2", biasing=biasing)
+
+    instance = reson8.STT(api_key="k", model="rumble-2")
+    with pytest.raises(ValueError, match=message):
+        instance.update_options(biasing=biasing)
+
+    with pytest.raises(ValueError, match=message):
+        STTOptions(model="rumble-2", biasing=biasing)
+
+
+def test_rumble_2_accepts_a_strength_of_1() -> None:
+    reson8.STT(api_key="k", model="rumble-2", biasing=BiasingOptions(strength=1))
+
+
+@pytest.mark.parametrize("model", [None, "resonant-1"])
+def test_patterns_and_a_strong_bias_pass_without_rumble_2(model: reson8.STTModel | None) -> None:
+    biasing = BiasingOptions(patterns=["AMZ[0-9]{6}"], strength=1.2)
+    reson8.STT(api_key="k", model=model, biasing=biasing)
+
+
 def test_an_unsupported_filler_mode_raises() -> None:
     with pytest.raises(ValueError, match=r"(?i)unsupported filler_mode"):
         TranscriptOptions(filler_mode="loud")  # type: ignore[arg-type]
@@ -730,6 +803,12 @@ def test_a_pinned_language_reaches_the_query_string(language: str, expected: str
 
 def test_language_is_omitted_for_auto_detection() -> None:
     assert "language" not in STTOptions().query_params(streaming=True)
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_the_model_reaches_both_endpoints(streaming: bool) -> None:
+    params = STTOptions(model="rumble-2").query_params(streaming=streaming)
+    assert params["model"] == "rumble-2"
 
 
 def test_confidence_is_batch_only() -> None:
